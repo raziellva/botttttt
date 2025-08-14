@@ -34,8 +34,7 @@ logger = logging.getLogger(__name__)
 PLAN_PRIORITY = {
     "premium": 1,
     "pro": 2,
-    "standard": 3,
-    "free": 4
+    "standard": 3
 }
 
 # Conexión a MongoDB
@@ -78,8 +77,8 @@ logger.info("Compresiones activas previas eliminadas")
 video_settings = {
     'resolution': '854x480',
     'crf': '28',
-    'audio_bitrate': '64k',
-    'fps': '20',
+    'audio_bitrate': '70k',
+    'fps': '22',
     'preset': 'veryfast',
     'codec': 'libx264'
 }
@@ -134,28 +133,18 @@ async def get_confirmation(confirmation_id: ObjectId):
 
 # ======================== AUTO-REGISTRO DE USUARIOS ======================== #
 
-async def register_new_user(user_id: int):
-    """Registra un nuevo usuario con plan free si no existe"""
-    if not users_col.find_one({"user_id": user_id}):
-        users_col.insert_one({
-            "user_id": user_id,
-            "plan": "free",
-            "used": 0,
-            "daily_used": 0,
-            "last_used_date": None,
-            "join_date": datetime.datetime.now()
-        })
-        logger.info(f"👤 Nuevo usuario registrado: {user_id} (Plan Free)")
+async def register_user_if_not_exists(user_id: int):
+    """Registra un usuario solo si no existe (sin crear automáticamente)"""
+    return bool(users_col.find_one({"user_id": user_id}))
 
 # ======================== FUNCIONES PROTECCIÓN DE CONTENIDO ======================== #
 
 async def should_protect_content(user_id: int) -> bool:
     """Determina si el contenido debe protegerse según el plan del usuario"""
-    await register_new_user(user_id)
     if user_id in admin_users:
         return False
     user_plan = await get_user_plan(user_id)
-    return user_plan["plan"] in ["free", "standard"]
+    return user_plan["plan"] in ["standard"]
 
 async def send_protected_message(chat_id: int, text: str, **kwargs):
     """Envía un mensaje con protección según el plan del usuario"""
@@ -177,7 +166,7 @@ async def send_protected_photo(chat_id: int, photo: str, caption: str = None, **
 async def get_user_priority(user_id: int) -> int:
     """Obtiene la prioridad del usuario basada en su plan"""
     user_plan = await get_user_plan(user_id)
-    return PLAN_PRIORITY.get(user_plan["plan"], 4)
+    return PLAN_PRIORITY.get(user_plan["plan"], 3)
 
 # ======================== SISTEMA DE CLAVES TEMPORALES ======================== #
 
@@ -282,81 +271,46 @@ async def list_keys_command(client, message):
 # ======================== SISTEMA DE PLANES ======================== #
 
 PLAN_LIMITS = {
-    "free": 1,
     "standard": 40,
     "pro": 90,
     "premium": 200
 }
 
 PLAN_DURATIONS = {
-    "free": "1 día",
     "standard": "7 días",
     "pro": "15 días",
     "premium": "30 días"
 }
 
 async def get_user_plan(user_id: int) -> dict:
-    """Obtiene el plan del usuario desde la base de datos con campos garantizados"""
-    await register_new_user(user_id)
-    
+    """Obtiene el plan del usuario desde la base de datos"""
     user = users_col.find_one({"user_id": user_id})
     if not user:
-        new_user = {
-            "user_id": user_id,
-            "plan": "free",
-            "used": 0,
-            "daily_used": 0,
-            "last_used_date": None,
-            "join_date": datetime.datetime.now()
-        }
-        users_col.insert_one(new_user)
-        return new_user
-    else:
-        update_data = {}
-        if "used" not in user:
-            update_data["used"] = 0
-        if "plan" not in user:
-            update_data["plan"] = "free"
-        if "daily_used" not in user:
-            update_data["daily_used"] = 0
-        if "last_used_date" not in user:
-            update_data["last_used_date"] = None
-        
-        if update_data:
-            users_col.update_one({"user_id": user_id}, {"$set": update_data})
-            user.update(update_data)
-        
-        return user
+        return None
+    
+    return user
 
 async def increment_user_usage(user_id: int):
     """Incrementa el contador de uso del usuario"""
     user = await get_user_plan(user_id)
-    
-    if user["plan"] == "free":
-        users_col.update_one({"user_id": user_id}, {"$inc": {"daily_used": 1}})
-    else:
+    if user:
         users_col.update_one({"user_id": user_id}, {"$inc": {"used": 1}})
-
-async def reset_user_usage(user_id: int):
-    """Resetea el contador de uso del usuario según su plan"""
-    user = await get_user_plan(user_id)
-    
-    if user["plan"] == "free":
-        update_data = {
-            "daily_used": 0,
-            "last_used_date": datetime.datetime.now()
-        }
-    else:
-        update_data = {"used": 0}
-    
-    users_col.update_one({"user_id": user_id}, {"$set": update_data})
 
 async def set_user_plan(user_id: int, plan: str):
     """Establece el plan de un usuario y notifica"""
     if plan not in PLAN_LIMITS:
         return False
-    user = await get_user_plan(user_id)
-    users_col.update_one({"user_id": user_id}, {"$set": {"plan": plan}})
+    
+    # Crear usuario si no existe
+    if not users_col.find_one({"user_id": user_id}):
+        users_col.insert_one({
+            "user_id": user_id,
+            "plan": plan,
+            "used": 0,
+            "join_date": datetime.datetime.now()
+        })
+    else:
+        users_col.update_one({"user_id": user_id}, {"$set": {"plan": plan}})
     
     # Notificar al usuario sobre su nuevo plan
     try:
@@ -376,46 +330,20 @@ async def set_user_plan(user_id: int, plan: str):
 async def check_user_limit(user_id: int) -> bool:
     """Verifica si el usuario ha alcanzado su límite de compresión"""
     user = await get_user_plan(user_id)
-    plan_type = user.get("plan", "free")
-    
-    if plan_type == "free":
-        today = datetime.datetime.now().date()
-        last_used = user.get("last_used_date")
+    if not user:
+        return True
         
-        if last_used is None or last_used.date() < today:
-            users_col.update_one(
-                {"user_id": user_id},
-                {"$set": {"daily_used": 0, "last_used_date": datetime.datetime.now()}}
-            )
-            return False
-        
-        daily_used = user.get("daily_used", 0)
-        return daily_used >= PLAN_LIMITS["free"]
-    
+    plan_type = user.get("plan", "standard")
     used_count = user.get("used", 0)
-    return used_count >= PLAN_LIMITS.get(plan_type, PLAN_LIMITS["free"])
+    return used_count >= PLAN_LIMITS.get(plan_type, PLAN_LIMITS["standard"])
 
 async def get_plan_info(user_id: int) -> str:
     """Obtiene información del plan del usuario para mostrar"""
     user = await get_user_plan(user_id)
+    if not user:
+        return "🔒 **No tienes un plan activo**\n\nPorfavor contrate uno de nuestros planes para usar el bot"
+    
     plan_name = user["plan"].capitalize()
-    
-    if user["plan"] == "free":
-        user_data = users_col.find_one({"user_id": user_id})
-        today = datetime.datetime.now().date()
-        last_used = user_data.get("last_used_date")
-        daily_used = user_data.get("daily_used", 0)
-        
-        if last_used is None or last_used.date() < today:
-            daily_used = 0
-        
-        return (
-            f"╭✠━━━━━━━━━━━━━━━━━━✠╮\n"
-            f"┠ **Plan actual**: {plan_name}\n"
-            f"┠ **Videos usados hoy**: {daily_used}/1\n"
-            f"╰✠━━━━━━━━━━━━━━━━━━✠╯"
-        )
-    
     used = user.get("used", 0)
     limit = PLAN_LIMITS[user["plan"]]
     remaining = max(0, limit - used)
@@ -567,8 +495,8 @@ async def show_queue(client, message):
         tiempo = item.get("timestamp")
         tiempo_str = tiempo.strftime("%H:%M:%S") if tiempo else "¿?"
         
-        priority = item.get("priority", 4)
-        plan_name = priority_to_plan.get(priority, "free").capitalize()
+        priority = item.get("priority", 3)
+        plan_name = priority_to_plan.get(priority, "standard").capitalize()
         
         respuesta += f"{i}. 👤 ID: `{user_id}` | 📁 {file_name} | ⏰ {tiempo_str} | 📋 {plan_name}\n"
 
@@ -585,7 +513,7 @@ async def startup_command(_, message):
 
     pending_col.update_many(
         {"priority": {"$exists": False}},
-        {"$set": {"priority": 4}}
+        {"$set": {"priority": 3}}
     )
 
     pendientes = pending_col.find().sort([("priority", 1), ("timestamp", 1)])
@@ -594,7 +522,7 @@ async def startup_command(_, message):
             user_id = item["user_id"]
             chat_id = item["chat_id"]
             message_id = item["message_id"]
-            priority = item.get("priority", 4)
+            priority = item.get("priority", 3)
             timestamp = item["timestamp"]
             
             message = await app.get_messages(chat_id, message_id)
@@ -879,25 +807,13 @@ def get_plan_menu_keyboard():
 
 async def get_plan_menu(user_id: int):
     user = await get_user_plan(user_id)
-    plan_name = user["plan"].capitalize()
-    
-    if user["plan"] == "free":
-        user_data = users_col.find_one({"user_id": user_id})
-        today = datetime.datetime.now().date()
-        last_used = user_data.get("last_used_date")
-        daily_used = user_data.get("daily_used", 0)
-        
-        if last_used is None or last_used.date() < today:
-            daily_used = 0
-        
+    if not user:
         return (
-            f"╭✠━━━━━━━━━━━━━━━━━━━━━━✠╮\n"
-            f"┠ **Tu plan actual**: {plan_name}\n"
-            f"┠ **Videos usados hoy**: {daily_used}/1\n"
-            f"╰✠━━━━━━━━━━━━━━━━━━━━━━✠╯\n\n"
+            "🔒 **No tienes un plan activo**\n\n"
             "📋 **Selecciona un plan para más información:**"
         ), get_plan_menu_keyboard()
     
+    plan_name = user["plan"].capitalize()
     used = user.get("used", 0)
     limit = PLAN_LIMITS[user["plan"]]
     remaining = max(0, limit - used)
@@ -932,7 +848,7 @@ async def planes_command(client, message):
 @app.on_callback_query()
 async def callback_handler(client, callback_query: CallbackQuery):
     config_map = {
-        "general": "resolution=720x480 crf=28 audio_bitrate=70k fps=22 preset=veryfast codec=libx264",
+        "general": "resolution=854x480 crf=28 audio_bitrate=70k fps=22 preset=veryfast codec=libx264",
         "reels": "resolution=420x720 crf=25 audio_bitrate=70k fps=30 preset=veryfast codec=libx264",
         "show": "resolution=854x480 crf=32 audio_bitrate=70k fps=20 preset=veryfast codec=libx264",
         "anime": "resolution=854x480 crf=32 audio_bitrate=64k fps=18 preset=veryfast codec=libx264"
@@ -963,13 +879,12 @@ async def callback_handler(client, callback_query: CallbackQuery):
         if action == "confirm":
             # Verificar límite nuevamente
             if await check_user_limit(user_id):
-                await callback_query.answer("⚠️ Has alcanzado tu límite diario/mensual de compresiones.", show_alert=True)
+                await callback_query.answer("⚠️ Has alcanzado tu límite de compresiones.", show_alert=True)
                 await delete_confirmation(confirmation_id)
                 return
 
-            # Verificar si ya hay una compresión activa o en cola (solo para Free)
-            user_plan = await get_user_plan(user_id)
-            if user_plan["plan"] == "free" and (await has_active_compression(user_id) or await has_pending_in_queue(user_id)):
+            # Verificar si ya hay una compresión activa o en cola
+            if await has_active_compression(user_id) or await has_pending_in_queue(user_id):
                 await callback_query.answer("⚠️ Ya hay un video en proceso o en cola.\nEspera a que termine.", show_alert=True)
                 await delete_confirmation(confirmation_id)
                 return
@@ -987,7 +902,7 @@ async def callback_handler(client, callback_query: CallbackQuery):
             # Editar mensaje de confirmación para mostrar estado
             queue_size = compression_queue.qsize()
             wait_msg = await callback_query.message.edit_text(
-                f"⏳ Tu video ha sido añadido a la cola.\nSi tienes Plan Pro o Premium tus vídeos tienen mas prioridad en la cola.\n\n[Los usuarios Free tienen la Prioridad mas baja en el bot]\n\n"
+                f"⏳ Tu video ha sido añadido a la cola.\nSi tienes Plan Pro o Premium tus vídeos tienen mas prioridad en la cola.\n\n"
                 f"📋 Tamaño actual de la cola: {queue_size}\n\n"
                 f"• **Espere que otros procesos terminen** ⏳"
             )
@@ -1105,10 +1020,28 @@ async def callback_handler(client, callback_query: CallbackQuery):
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
     try:
-        await register_new_user(message.from_user.id)
+        user_id = message.from_user.id
         
-        if message.from_user.id in ban_users:
-            logger.warning(f"Usuario baneado intentó usar /start: {message.from_user.id}")
+        if user_id in ban_users:
+            logger.warning(f"Usuario baneado intentó usar /start: {user_id}")
+            return
+        
+        # Verificar si el usuario tiene acceso
+        has_access = await register_user_if_not_exists(user_id)
+        
+        if not has_access:
+            # Enviar mensaje de acceso denegado
+            await send_protected_message(
+                message.chat.id,
+                "🔒 **Usted no tiene acceso para usar este bot**\n\n"
+                "Por favor contrate uno de nuestros planes para usar el servicio:\n\n"
+                "📋 **Planes disponibles:**\n"
+                "• 🧩 Estándar: 180 CUP / 7 días\n"
+                "• 💎 Pro: 400 CUP / 15 días\n"
+                "• 👑 Premium: 850 CUP / 30 días\n\n"
+                "👨‍💻 **Contacte con @InfiniteNetworkAdmin**"
+            )
+            logger.info(f"Usuario sin acceso intentó usar el bot: {user_id}")
             return
         
         # Ruta de la imagen del logo (asegúrate de tener el archivo en tu directorio)
@@ -1146,6 +1079,16 @@ async def main_menu_handler(client, message):
         user_id = message.from_user.id
 
         if user_id in ban_users:
+            return
+            
+        # Verificar si el usuario tiene acceso
+        if not await register_user_if_not_exists(user_id):
+            await send_protected_message(
+                message.chat.id,
+                "🔒 **Usted no tiene acceso para usar este bot**\n\n"
+                "Por favor contrate uno de nuestros planes para usar el servicio:\n\n"
+                "👨‍💻 **Contacte con @InfiniteNetworkAdmin**"
+            )
             return
             
         if text == "⚙️ settings":
@@ -1243,10 +1186,11 @@ async def access_command(client, message):
     try:
         user_id = message.from_user.id
         
+        # Paso 1: Verificar baneo
         if user_id in ban_users:
             await send_protected_message(message.chat.id, "🔒 Tu acceso ha sido revocado.")
             return
-            
+        
         logger.info(f"Comando access recibido de {user_id}")
         
         if len(message.command) < 2:
@@ -1290,8 +1234,8 @@ def is_bot_public():
 @app.on_message(filters.command("myplan") & filters.private)
 async def my_plan_command(client, message):
     try:
-        await register_new_user(message.from_user.id)
-        plan_info = await get_plan_info(message.from_user.id)
+        user_id = message.from_user.id
+        plan_info = await get_plan_info(user_id)
         await send_protected_message(
             message.chat.id, 
             plan_info,
@@ -1337,7 +1281,7 @@ async def reset_user_command(client, message):
             return
         
         user_id = int(parts[1])
-        await reset_user_usage(user_id)
+        users_col.update_one({"user_id": user_id}, {"$set": {"used": 0}})
         await message.reply(f"✅ **Contador de videos del usuario {user_id} reiniciado a 0.**")
     except Exception as e:
         logger.error(f"Error en reset_user_command: {e}", exc_info=True)
@@ -1361,28 +1305,12 @@ async def user_info_command(client, message):
             if isinstance(join_date, datetime.datetime):
                 join_date = join_date.strftime("%Y-%m-%d %H:%M:%S")
             
-            if user["plan"] == "free":
-                user_data = users_col.find_one({"user_id": user_id})
-                today = datetime.datetime.now().date()
-                last_used = user_data.get("last_used_date")
-                daily_used = user_data.get("daily_used", 0)
-                
-                if last_used is None or last_used.date() < today:
-                    daily_used = 0
-                
-                await message.reply(
-                    f"👤 **ID**: `{user_id}`\n"
-                    f"📝 **Plan**: {plan}\n"
-                    f"🔢 **Videos usados hoy**: {daily_used}/1\n"
-                    f"📅 **Fecha de registro**: {join_date}"
-                )
-            else:
-                await message.reply(
-                    f"👤 **ID**: `{user_id}`\n"
-                    f"📝 **Plan**: {plan}\n"
-                    f"🔢 **Videos comprimidos**: {used}/{limit}\n"
-                    f"📅 **Fecha de registro**: {join_date}"
-                )
+            await message.reply(
+                f"👤 **ID**: `{user_id}`\n"
+                f"📝 **Plan**: {plan}\n"
+                f"🔢 **Videos comprimidos**: {used}/{limit}\n"
+                f"📅 **Fecha de registro**: {join_date}"
+            )
         else:
             await message.reply("⚠️ Usuario no encontrado")
     except Exception as e:
@@ -1460,7 +1388,6 @@ async def admin_stats_command(client, message):
         response += "📝 **Distribución por Planes:**\n"
         
         plan_names = {
-            "free": "🆓 Free",
             "standard": "🧩 Estándar",
             "pro": "💎 Pro",
             "premium": "👑 Premium"
@@ -1568,6 +1495,16 @@ async def queue_command(client, message):
     """Muestra información sobre la cola de compresión"""
     user_id = message.from_user.id
     
+    # Verificar acceso
+    if not await register_user_if_not_exists(user_id):
+        await send_protected_message(
+            message.chat.id,
+            "🔒 **Usted no tiene acceso para usar este bot**\n\n"
+            "Por favor contrate uno de nuestros planes para usar el servicio:\n\n"
+            "👨‍💻 **Contacte con @InfiniteNetworkAdmin**"
+        )
+        return
+    
     # Para administradores: mostrar cola completa
     if user_id in admin_users:
         await show_queue(client, message)
@@ -1615,17 +1552,24 @@ async def handle_video(client, message: Message):
     try:
         user_id = message.from_user.id
         
-        # Paso 1: Auto-registro
-        await register_new_user(user_id)
-        
-        # Paso 2: Verificar baneo
+        # Paso 1: Verificar baneo
         if user_id in ban_users:
             logger.warning(f"Intento de uso por usuario baneado: {user_id}")
             return
         
-        # Paso 3: Verificar si ya tiene una compresión activa o en cola (solo para Free)
+        # Paso 2: Verificar si tiene acceso (plan activo)
         user_plan = await get_user_plan(user_id)
-        if user_plan["plan"] == "free" and (await has_active_compression(user_id) or await has_pending_in_queue(user_id)):
+        if not user_plan:
+            await send_protected_message(
+                message.chat.id,
+                "🔒 **Usted no tiene acceso para usar este bot**\n\n"
+                "Por favor contrate uno de nuestros planes para usar el servicio:\n\n"
+                "👨‍💻 **Contacte con @InfiniteNetworkAdmin**"
+            )
+            return
+        
+        # Paso 3: Verificar si ya tiene una compresión activa o en cola
+        if await has_active_compression(user_id) or await has_pending_in_queue(user_id):
             await send_protected_message(
                 message.chat.id,
                 "⏳ Ya tienes un video en proceso de compresión o en cola.\n"
@@ -1640,29 +1584,12 @@ async def handle_video(client, message: Message):
         
         # Paso 5: Verificar límite de plan
         if await check_user_limit(user_id):
-            if user_plan["plan"] == "free":
-                user_data = users_col.find_one({"user_id": user_id})
-                today = datetime.datetime.now().date()
-                last_used = user_data.get("last_used_date")
-                daily_used = user_data.get("daily_used", 0)
-                
-                if last_used is None or last_used.date() < today:
-                    daily_used = 0
-                
-                await send_protected_message(
-                    message.chat.id,
-                    f"⚠️ **Límite diario alcanzado**\n"
-                    f"Has usado {daily_used}/1 videos hoy.\n\n"
-                    "Los usuarios Free pueden comprimir 1 video por día.\n\n"
-                    "📩**Contacta con @InfiniteNetworkAdmin para actualizar tu Plan a Estándar/Pro/Premium**",
-                )
-            else:
-                await send_protected_message(
-                    message.chat.id,
-                    f"⚠️ **Límite alcanzado**\n"
-                    f"Has usado {user_plan['used']}/{PLAN_LIMITS[user_plan['plan']]} videos.\n\n"
-                    "📩**Contacta con @InfiniteNetworkAdmin para actualizar tu Plan a Estándar/Pro/Premium**"
-                )
+            await send_protected_message(
+                message.chat.id,
+                f"⚠️ **Límite alcanzado**\n"
+                f"Has usado {user_plan['used']}/{PLAN_LIMITS[user_plan['plan']]} videos.\n\n"
+                "📩**Contacta con @InfiniteNetworkAdmin para actualizar tu Plan**"
+            )
             return
         
         # Paso 6: Crear confirmación pendiente
@@ -1683,8 +1610,7 @@ async def handle_video(client, message: Message):
         await send_protected_message(
             message.chat.id,
             f"🎬 **Video recibido para comprimír:** `{message.video.file_name}`\n"
-            f"¿Deseas comprimir este video?\n\n"
-            f"⚠️ Los del Plan Free solo pueden tener un video en cola a la vez",
+            f"¿Deseas comprimir este video?",
             reply_markup=keyboard
         )
         
@@ -1706,57 +1632,47 @@ async def handle_message(client, message):
 
         logger.info(f"Mensaje recibido de {user_id}: {text}")
 
-        await register_new_user(user_id)
-
-        if text.startswith(('/calidad', '.calidad')):
-            update_video_settings(text[len('/calidad '):])
-            await message.reply(f"⚙️ Configuración Actualizada✅: {video_settings}")
-        elif text.startswith(('/settings', '.settings')):
-            await settings_menu(client, message)
-        elif text.startswith(('/banuser', '.banuser', '/deluser', '.deluser')):
-            if user_id in admin_users:
+        # Verificar acceso para comandos principales
+        if text in ["/start", "/myplan", "/planes", "⚙️ settings", "📋 planes", "📊 mi plan", "ℹ️ ayuda", "👀 ver cola"]:
+            # El manejo de acceso ya está en los handlers específicos
+            return
+            
+        # Solo administradores pueden ejecutar comandos administrativos
+        if user_id in admin_users:
+            if text.startswith(('/calidad', '.calidad')):
+                update_video_settings(text[len('/calidad '):])
+                await message.reply(f"⚙️ Configuración Actualizada✅: {video_settings}")
+            elif text.startswith(('/settings', '.settings')):
+                await settings_menu(client, message)
+            elif text.startswith(('/banuser', '.banuser', '/deluser', '.deluser')):
                 await ban_or_delete_user_command(client, message)
-            else:
-                logger.warning(f"Intento no autorizado de banuser/deluser por {user_id}")
-        elif text.startswith(('/cola', '.cola')):
-            if user_id in admin_users:
+            elif text.startswith(('/cola', '.cola')):
                 await ver_cola_command(client, message)
-        elif text.startswith(('/auto', '.auto')):
-            if user_id in admin_users:
+            elif text.startswith(('/auto', '.auto')):
                 await startup_command(client, message)
-        elif text.startswith(('/myplan', '.myplan')):
-            await my_plan_command(client, message)
-        elif text.startswith(('/setplan', '.setplan')):
-            if user_id in admin_users:
+            elif text.startswith(('/myplan', '.myplan')):
+                await my_plan_command(client, message)
+            elif text.startswith(('/setplan', '.setplan')):
                 await set_plan_command(client, message)
-        elif text.startswith(('/resetuser', '.resetuser')):
-            if user_id in admin_users:
+            elif text.startswith(('/resetuser', '.resetuser')):
                 await reset_user_command(client, message)
-        elif text.startswith(('/userinfo', '.userinfo')):
-            if user_id in admin_users:
+            elif text.startswith(('/userinfo', '.userinfo')):
                 await user_info_command(client, message)
-        elif text.startswith(('/planes', '.planes')):
-            await planes_command(client, message)
-        elif text.startswith(('/generatekey', '.generatekey')):
-            if user_id in admin_users:
+            elif text.startswith(('/planes', '.planes')):
+                await planes_command(client, message)
+            elif text.startswith(('/generatekey', '.generatekey')):
                 await generate_key_command(client, message)
-        elif text.startswith(('/listkeys', '.listkeys')):
-            if user_id in admin_users:
+            elif text.startswith(('/listkeys', '.listkeys')):
                 await list_keys_command(client, message)
-        elif text.startswith(('/user', '.user')):
-            if user_id in admin_users:
+            elif text.startswith(('/user', '.user')):
                 await list_users_command(client, message)
-        elif text.startswith(('/admin', '.admin')):
-            if user_id in admin_users:
+            elif text.startswith(('/admin', '.admin')):
                 await admin_stats_command(client, message)
-        elif text.startswith(('/restuser', '.restuser')):
-            if user_id in admin_users:
+            elif text.startswith(('/restuser', '.restuser')):
                 await reset_all_users_command(client, message)
-        elif text.startswith(('/desuser', '.desuser')):
-            if user_id in admin_users:
+            elif text.startswith(('/desuser', '.desuser')):
                 await unban_user_command(client, message)
-        elif text.startswith(('/msg', '.msg')):
-            if user_id in admin_users:
+            elif text.startswith(('/msg', '.msg')):
                 await broadcast_command(client, message)
 
         if message.reply_to_message:
